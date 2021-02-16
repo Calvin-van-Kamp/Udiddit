@@ -1,0 +1,147 @@
+/*Start creating the new schema*/
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(25) UNIQUE NOT NULL,
+    last_login DATE
+);
+/*Index for quickly finding those who have not logged in within the last year*/
+CREATE INDEX loggins ON users (last_login) WHERE 'last_login' < CURRENT_DATE - 365;
+/*Index for quickly searching user names*/
+CREATE INDEX usernames_index ON users (username);
+
+CREATE TABLE topics (
+    id SERIAL PRIMARY KEY,
+    topic_name VARCHAR(30) UNIQUE NOT NULL,
+    description VARCHAR(500)
+);
+
+CREATE TABLE posts (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(100) NOT NULL,
+    url VARCHAR,
+    content TEXT,
+    topic_id BIGINT,
+    user_id BIGINT,
+    post_date DATE,
+    CONSTRAINT user_posts_fk FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+    CONSTRAINT topic_posts_fk FOREIGN KEY (topic_id) REFERENCES topics (id) ON DELETE CASCADE,
+    CONSTRAINT only_one_filled 
+        CHECK ((url IS NULL OR content IS NULL) 
+               AND NOT (url IS NULL AND content IS NULL))
+);
+/*Make it easier to find users without posts*/
+CREATE TABLE uwp AS (
+    SELECT users.id AS userz, posts.id AS postz
+    FROM users
+    LEFT JOIN posts
+    ON users.id = posts.topic_id);
+CREATE INDEX user_nopost ON uwp (userz) WHERE postz IS NULL;
+/*Make it easier to find topics without posts*/
+CREATE TABLE twp AS (
+    SELECT topics.id AS topicz, posts.id AS postz
+    FROM topics
+    LEFT JOIN posts
+    ON topics.id = posts.topic_id);
+CREATE INDEX topic_nopost ON twp (topicz) WHERE postz IS NULL;
+/*Easier to get the latest 20 posts by topic and user*/
+CREATE INDEX recent_by_topic ON posts (topic_id,post_date DESC);
+CREATE INDEX recent_by_user ON posts (user_id, post_date DESC);
+/*Posts wrt to a specific url*/
+CREATE UNIQUE INDEX multi_url ON posts (url);
+
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    content TEXT NOT NULL,
+    user_id BIGINT,
+    post_id BIGINT,
+    comment_id BIGINT /*ID of the comment it is replying to, NULL if otherwise*/,
+    comment_date DATE,
+    CONSTRAINT user_com_fk FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+    CONSTRAINT posts_com_fk FOREIGN KEY (post_id) REFERENCES posts (id) ON DELETE CASCADE,
+    CONSTRAINT com_com_fk FOREIGN KEY (comment_id) REFERENCES comments (id) ON DELETE CASCADE
+);
+/*Easily find all parent comments*/
+CREATE INDEX parent_comm ON comments (comment_id) WHERE comment_id IS NULL;
+/*Find all children of a parent comment*/
+CREATE INDEX children_comm ON comments (comment_id);
+/*Most recent 20 comments by user*/
+CREATE INDEX recentcomm_by_user ON posts (user_id, post_date DESC);
+
+CREATE TABLE votes (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT,
+    post_id BIGINT,
+    value SMALLINT,
+    CONSTRAINT user_votes_fk FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+    CONSTRAINT posts_votes_fk FOREIGN KEY (post_id) REFERENCES posts (id) ON DELETE CASCADE
+);
+/*Easy vote balance computation*/
+CREATE UNIQUE INDEX ez_votes ON votes (post_id);
+/*ensure correct vote values*/
+ALTER TABLE votes ADD CONSTRAINT check_votes CHECK (value = 1 OR value = -1);
+
+/*migration*/
+/*users*/
+INSERT INTO users (username)
+SELECT
+  REGEXP_SPLIT_TO_TABLE(bad_posts.username, ',')
+FROM bad_posts
+UNION
+SELECT
+  REGEXP_SPLIT_TO_TABLE(bad_posts.upvotes, ',')
+FROM bad_posts
+UNION
+SELECT
+  REGEXP_SPLIT_TO_TABLE(bad_posts.downvotes, ',')
+FROM bad_posts;
+
+/*topics*/
+INSERT INTO topics (topic_name)
+SELECT DISTINCT topic FROM bad_posts;
+
+/*posts*/
+INSERT INTO posts (title,url,content,topic_id,user_id)
+SELECT bp.title, bp.url, bp.text_content, t.id, u.id
+FROM bad_posts bp
+JOIN topics t
+ON bp.topic = t.topic_name
+JOIN users u
+ON bp.username = u.username;
+
+/*comments*/
+INSERT INTO comments (post_id,content,user_id)
+SELECT p.id, bc.text_content, u.id
+FROM bad_comments bc
+JOIN posts p
+ON bc.post_id = p.id
+JOIN users u
+ON bc.username = u.username;
+
+/*votes*/
+/*this one'll be tricky, so we first create separate up- and down-vote views*/
+CREATE VIEW new_up_votes AS(
+SELECT p.id post_id, LEFT(bp.title,100) titles, REGEXP_SPLIT_TO_TABLE(bp.upvotes, ',') AS names, 1 ones
+FROM bad_posts bp
+JOIN posts p
+ON LEFT(bp.title,100) = p.title 
+ORDER BY 1);
+
+CREATE VIEW new_down_votes AS(
+SELECT p.id post_id, LEFT(bp.title,100) titles, REGEXP_SPLIT_TO_TABLE(bp.downvotes, ',') AS names, -1 ones
+FROM bad_posts bp
+JOIN posts p
+ON LEFT(bp.title,100) = p.title 
+ORDER BY 1);
+
+/*without the previous views, user ID's were not matched correctly, they need tobe matched on the already-split column of usernames*/
+INSERT INTO votes (post_id,user_id,value)
+SELECT nuv.post_id, u.id, nuv.ones
+FROM new_up_votes nuv
+JOIN users u
+ON u.username = nuv.names
+UNION ALL
+SELECT ndv.post_id, u.id, ndv.ones
+FROM new_down_votes ndv
+JOIN users u
+ON u.username = ndv.names
+ORDER BY 1, 3 DESC;
